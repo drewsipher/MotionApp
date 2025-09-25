@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local configuration files
+local.properties
+
+# Android Studio
+.idea/
+*.iml
+.cache/
+captures/
+.navigation/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kotlin/Java
+*.class
+
+# Misc
+*.apk
+*.aab
+*.keystore
+*.jks
