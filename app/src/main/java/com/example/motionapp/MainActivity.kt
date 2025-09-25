@@ -9,6 +9,8 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Size
 import androidx.activity.ComponentActivity
@@ -69,6 +71,7 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -187,11 +190,18 @@ private fun CameraPreviewWithControls(
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val bitmapConverter = remember { ImageProxyBitmapConverter() }
+    val bitmapPool = remember { BitmapPool() }
 
     var motionFrame by remember { mutableStateOf<MotionFrame?>(null) }
+    val motionProcessor = remember(bitmapPool) {
+        MotionProcessor(bitmapPool) { frame ->
+            val previous = motionFrame
+            motionFrame = frame
+            previous?.bitmap?.let(bitmapPool::release)
+        }
+    }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     var camControl by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
-    var analyzer by remember { mutableStateOf<MotionAnalyzer?>(null) }
     var minZoom by remember { mutableFloatStateOf(1f) }
     var maxZoom by remember { mutableFloatStateOf(10f) }
     val minZoomState = rememberUpdatedState(minZoom)
@@ -201,11 +211,17 @@ private fun CameraPreviewWithControls(
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
             analysisExecutor.shutdown()
+            motionProcessor.shutdown()
+            motionFrame?.bitmap?.let(bitmapPool::release)
         }
     }
 
     // Rebind camera when lens facing or quality changes
     LaunchedEffect(useFront, quality) {
+        motionProcessor.clear()
+        val previousFrame = motionFrame
+        motionFrame = null
+        previousFrame?.bitmap?.let(bitmapPool::release)
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
         cameraProvider.unbindAll()
 
@@ -218,11 +234,8 @@ private fun CameraPreviewWithControls(
         val newAnalyzer = MotionAnalyzer(
             mirror = useFront,
             converter = bitmapConverter,
-            onFrame = { frame -> motionFrame = frame }
+            processor = motionProcessor
         )
-        newAnalyzer.frameGap = frameGap
-        newAnalyzer.weight = motionWeight
-        analyzer = newAnalyzer
         imageAnalysis.setAnalyzer(analysisExecutor, newAnalyzer)
 
         val cameraSelector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
@@ -237,8 +250,8 @@ private fun CameraPreviewWithControls(
         camControl?.setZoomRatio(zoom.coerceIn(minZoom, maxZoom)) // Apply initial zoom
     }
 
-    LaunchedEffect(motionWeight) { analyzer?.weight = motionWeight }
-    LaunchedEffect(frameGap) { analyzer?.frameGap = frameGap }
+    LaunchedEffect(motionWeight) { motionProcessor.weight = motionWeight }
+    LaunchedEffect(frameGap) { motionProcessor.frameGap = frameGap }
     LaunchedEffect(zoom) { camControl?.setZoomRatio(zoom.coerceIn(minZoom, maxZoom)) }
 
     Box(Modifier.fillMaxSize()) {
@@ -372,29 +385,112 @@ data class MotionFrame(
 class MotionAnalyzer(
     private val mirror: Boolean,
     private val converter: ImageProxyBitmapConverter,
-    private val onFrame: (MotionFrame) -> Unit,
+    private val processor: MotionProcessor,
 ) : ImageAnalysis.Analyzer {
-    private val buffer = ArrayDeque<android.graphics.Bitmap>()
-    @Volatile var frameGap: Int = 5
-    @Volatile var weight: Float = 0.5f
-
     override fun analyze(image: ImageProxy) {
         try {
             val bmp = converter.convert(image)
-            buffer.addLast(bmp)
-            val gap = frameGap.coerceAtLeast(1)
-            if (buffer.size > gap) {
-                val prev = buffer.elementAt(buffer.size - 1 - gap)
-                val out = MotionFilters.invertAndAverage(bmp, prev, weight)
-                onFrame(MotionFrame(out, image.imageInfo.rotationDegrees, mirror))
-            }
-            while (buffer.size > 60) buffer.removeFirst().recycle()
+            processor.submit(bmp, image.imageInfo.rotationDegrees, mirror)
         } finally {
             image.close()
         }
     }
 }
 
+class BitmapPool {
+    private val items = mutableListOf<android.graphics.Bitmap>()
+
+    fun acquire(width: Int, height: Int): android.graphics.Bitmap {
+        synchronized(items) {
+            val index = items.indexOfFirst { it.width == width && it.height == height && !it.isRecycled }
+            return if (index >= 0) {
+                items.removeAt(index)
+            } else {
+                android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+            }
+        }
+    }
+
+    fun release(bitmap: android.graphics.Bitmap) {
+        if (bitmap.isRecycled) return
+        synchronized(items) {
+            items.add(bitmap)
+        }
+    }
+
+    fun clear() {
+        synchronized(items) {
+            items.forEach { it.recycle() }
+            items.clear()
+        }
+    }
+}
+
+class MotionProcessor(
+    private val pool: BitmapPool,
+    private val onFrame: (MotionFrame) -> Unit
+) {
+    private val executor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val buffer = ArrayDeque<android.graphics.Bitmap>()
+
+    @Volatile var frameGap: Int = 5
+    @Volatile var weight: Float = 0.5f
+
+    fun submit(frame: android.graphics.Bitmap, rotation: Int, mirror: Boolean) {
+        try {
+            executor.execute {
+                buffer.addLast(frame)
+                val gap = frameGap.coerceAtLeast(1)
+
+                val outputBitmap = if (buffer.size > gap) {
+                    val prev = buffer.elementAt(buffer.size - 1 - gap)
+                    val reuse = pool.acquire(frame.width, frame.height)
+                    MotionFilters.invertAndAverage(frame, prev, weight, reuse)
+                } else null
+
+                while (buffer.size > gap + 10) {
+                    val old = buffer.removeFirst()
+                    if (old !== frame) pool.release(old)
+                }
+
+                if (outputBitmap != null) {
+                    mainHandler.post {
+                        onFrame(MotionFrame(outputBitmap, rotation, mirror))
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            pool.release(frame)
+        }
+    }
+
+    fun clear() {
+        try {
+            executor.execute {
+                buffer.forEach { pool.release(it) }
+                buffer.clear()
+            }
+        } catch (_: RejectedExecutionException) {
+            buffer.forEach { pool.release(it) }
+            buffer.clear()
+        }
+    }
+
+    fun shutdown() {
+        try {
+            executor.execute {
+                buffer.forEach { pool.release(it) }
+                buffer.clear()
+            }
+        } catch (_: RejectedExecutionException) {
+            buffer.forEach { pool.release(it) }
+            buffer.clear()
+        } finally {
+            executor.shutdown()
+        }
+    }
+}
 // --- Video Screen ---
 @Composable
 fun VideoScreen(onBack: () -> Unit) {

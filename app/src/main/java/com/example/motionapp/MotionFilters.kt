@@ -15,10 +15,19 @@ object MotionFilters {
 
     // Takes current and previous frame, inverts current, then averages with previous.
     // weight is how much to weight the current inverted vs previous (0..1).
-    fun invertAndAverage(current: Bitmap, previous: Bitmap, weight: Float): Bitmap {
+    fun invertAndAverage(
+        current: Bitmap,
+        previous: Bitmap,
+        weight: Float,
+        reuse: Bitmap? = null
+    ): Bitmap {
         val w = minOf(current.width, previous.width)
         val h = minOf(current.height, previous.height)
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val out = if (reuse != null && reuse.width == w && reuse.height == h && reuse.config == Bitmap.Config.ARGB_8888 && !reuse.isRecycled) {
+            reuse
+        } else {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        }
 
         val scratchBuffers = scratch.get()
         scratchBuffers.ensure(w * h)
