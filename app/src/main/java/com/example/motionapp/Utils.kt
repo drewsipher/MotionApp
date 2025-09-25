@@ -43,8 +43,9 @@ private fun yuv420ToBitmap(image: ImageProxy): Bitmap? {
     }
 
     val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+    val cropRect = image.cropRect ?: android.graphics.Rect(0, 0, width, height)
     val out = java.io.ByteArrayOutputStream()
-    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 80, out)
+    yuvImage.compressToJpeg(cropRect, 80, out)
     val imageBytes = out.toByteArray()
     return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
 }

@@ -116,6 +116,7 @@ fun CameraScreen(onBack: () -> Unit) {
     var frameGap by remember { mutableIntStateOf(5) } // n frames apart
     var useFront by remember { mutableStateOf(false) }
     var zoom by remember { mutableFloatStateOf(1.0f) }
+    var quality by remember { mutableStateOf(CameraQuality.Medium) }
 
     Column(Modifier.fillMaxSize()) {
         androidx.compose.material.TopAppBar(
@@ -136,7 +137,9 @@ fun CameraScreen(onBack: () -> Unit) {
                 frameGap = frameGap,
                 onFrameGapChange = { frameGap = it },
                 zoom = zoom,
-                onZoomChange = { zoom = it }
+                onZoomChange = { zoom = it },
+                quality = quality,
+                onQualityChange = { quality = it }
             )
         } else {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -156,6 +159,8 @@ private fun CameraPreviewWithControls(
     onFrameGapChange: (Int) -> Unit,
     zoom: Float,
     onZoomChange: (Float) -> Unit,
+    quality: CameraQuality,
+    onQualityChange: (CameraQuality) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
@@ -165,6 +170,11 @@ private fun CameraPreviewWithControls(
     var camControl by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
     var camInfo by remember { mutableStateOf<androidx.camera.core.CameraInfo?>(null) }
     var analyzer by remember { mutableStateOf<MotionAnalyzer?>(null) }
+    var minZoom by remember { mutableFloatStateOf(1f) }
+    var maxZoom by remember { mutableFloatStateOf(10f) }
+    val minZoomState = rememberUpdatedState(minZoom)
+    val maxZoomState = rememberUpdatedState(maxZoom)
+    val zoomState = rememberUpdatedState(zoom)
 
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
@@ -172,12 +182,14 @@ private fun CameraPreviewWithControls(
         }
     }
 
-    LaunchedEffect(useFront) {
+    // Rebind camera when lens facing or quality changes
+    LaunchedEffect(useFront, quality) {
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
         cameraProvider.unbindAll()
 
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setTargetResolution(android.util.Size(quality.width, quality.height))
             .build()
 
         val newAnalyzer = MotionAnalyzer(
@@ -193,21 +205,18 @@ private fun CameraPreviewWithControls(
         val camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
         camControl = camera.cameraControl
         camInfo = camera.cameraInfo
-        
-        // Observe zoom state from CameraInfo to update our zoom state if it changes externally
-        // and to get min/max zoom ratios.
-        camera.cameraInfo.zoomState.observe(lifecycleOwner) { state ->
-            val currentZoomRatio = state?.zoomRatio ?: 1f
-            if (kotlin.math.abs(currentZoomRatio - zoom) > 0.01f) {
-                onZoomChange(currentZoomRatio)
-            }
+
+        // Capture min/max zoom bounds and apply the current zoom
+        camera.cameraInfo.zoomState.value?.let { state ->
+            minZoom = state.minZoomRatio
+            maxZoom = state.maxZoomRatio
         }
-        camControl?.setZoomRatio(zoom) // Apply initial zoom
+        camControl?.setZoomRatio(zoom.coerceIn(minZoom, maxZoom)) // Apply initial zoom
     }
 
     LaunchedEffect(motionWeight) { analyzer?.weight = motionWeight }
     LaunchedEffect(frameGap) { analyzer?.frameGap = frameGap }
-    LaunchedEffect(zoom) { camControl?.setZoomRatio(zoom) }
+    LaunchedEffect(zoom) { camControl?.setZoomRatio(zoom.coerceIn(minZoom, maxZoom)) }
 
     Box(Modifier.fillMaxSize()) {
         Box(
@@ -215,11 +224,17 @@ private fun CameraPreviewWithControls(
                 .fillMaxSize()
                 .background(Color.Black)
                 .pointerInput(Unit) {
-                    detectTransformGestures { _, _, gestureZoom, _ ->
-                        val minZoom = camInfo?.zoomState?.value?.minZoomRatio ?: 1f
-                        val maxZoom = camInfo?.zoomState?.value?.maxZoomRatio ?: 8f // Default max if not available
-                        val newZoom = (zoom * gestureZoom).coerceIn(minZoom, maxZoom)
-                        onZoomChange(newZoom)
+                    while (true) {
+                        var currentZoom = zoomState.value
+                        detectTransformGestures { _, _, gestureZoom, _ ->
+                            val boundsMin = minZoomState.value
+                            val boundsMax = maxZoomState.value
+                            val newZoom = (currentZoom * gestureZoom).coerceIn(boundsMin, boundsMax)
+                            if (kotlin.math.abs(newZoom - currentZoom) > 0.0001f) {
+                                currentZoom = newZoom
+                                onZoomChange(newZoom)
+                            }
+                        }
                     }
                 }
         ) {
@@ -238,6 +253,8 @@ private fun CameraPreviewWithControls(
                 onMotionWeightChange = onMotionWeightChange,
                 frameGap = frameGap,
                 onFrameGapChange = onFrameGapChange,
+                quality = quality,
+                onQualityChange = onQualityChange,
                 onToggleCamera = onToggleCamera
             )
         }
@@ -250,6 +267,8 @@ fun MotionControls(
     onMotionWeightChange: (Float) -> Unit,
     frameGap: Int,
     onFrameGapChange: (Int) -> Unit,
+    quality: CameraQuality,
+    onQualityChange: (CameraQuality) -> Unit,
     onToggleCamera: () -> Unit
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -260,13 +279,45 @@ fun MotionControls(
         Slider(value = frameGap.toFloat(), onValueChange = { onFrameGapChange(it.toInt().coerceIn(1, 30)) }, valueRange = 1f..30f)
         Spacer(Modifier.height(8.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            // Placeholder for quality dropdown - to be added later
-            Spacer(Modifier.weight(1f)) // Takes up space so IconButton is on the other side
+            QualityDropdown(quality = quality, onQualityChange = onQualityChange)
             IconButton(onClick = onToggleCamera) {
                 Icon(imageVector = Icons.Filled.Cameraswitch, contentDescription = "Swap Camera")
             }
         }
     }
+}
+
+@Composable
+private fun QualityDropdown(
+    quality: CameraQuality,
+    onQualityChange: (CameraQuality) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { expanded = true }) {
+            Text("Quality: ${quality.label}")
+        }
+        androidx.compose.material.DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            CameraQuality.values().forEach { q ->
+                androidx.compose.material.DropdownMenuItem(onClick = {
+                    expanded = false
+                    if (q != quality) onQualityChange(q)
+                }) {
+                    Text(q.label)
+                }
+            }
+        }
+    }
+}
+
+enum class CameraQuality(val label: String, val width: Int, val height: Int) {
+    Low("480p", 640, 480),
+    Medium("720p", 1280, 720),
+    High("1080p", 1920, 1080),
+    Ultra("1440p", 2560, 1440);
 }
 
 @Composable
