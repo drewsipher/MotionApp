@@ -11,9 +11,11 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -26,6 +28,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.WindowInsets
@@ -112,7 +115,6 @@ fun CameraScreen(onBack: () -> Unit) {
     var motionWeight by remember { mutableFloatStateOf(0.5f) } // weight for current inverted vs previous
     var frameGap by remember { mutableIntStateOf(5) } // n frames apart
     var useFront by remember { mutableStateOf(false) }
-
     var zoom by remember { mutableFloatStateOf(1.0f) }
 
     Column(Modifier.fillMaxSize()) {
@@ -120,7 +122,9 @@ fun CameraScreen(onBack: () -> Unit) {
             title = { Text("Live Camera") },
             navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
-            }
+            },
+            backgroundColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
         )
 
         if (hasCamera) {
@@ -156,12 +160,12 @@ private fun CameraPreviewWithControls(
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
-    var analysis by remember { mutableStateOf<ImageAnalysis?>(null) }
     var motionBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     var camControl by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
     var camInfo by remember { mutableStateOf<androidx.camera.core.CameraInfo?>(null) }
     var analyzer by remember { mutableStateOf<MotionAnalyzer?>(null) }
+
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
             analysisExecutor.shutdown()
@@ -189,27 +193,38 @@ private fun CameraPreviewWithControls(
         val camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
         camControl = camera.cameraControl
         camInfo = camera.cameraInfo
-        val zoomState = camera.cameraInfo.zoomState
-        zoomState.observe(lifecycleOwner) { st ->
-            val newZoom = st?.zoomRatio ?: 1f
-            if (kotlin.math.abs(newZoom - zoom) > 0.01f) {
-                onZoomChange(newZoom)
+        
+        // Observe zoom state from CameraInfo to update our zoom state if it changes externally
+        // and to get min/max zoom ratios.
+        camera.cameraInfo.zoomState.observe(lifecycleOwner) { state ->
+            val currentZoomRatio = state?.zoomRatio ?: 1f
+            if (kotlin.math.abs(currentZoomRatio - zoom) > 0.01f) {
+                onZoomChange(currentZoomRatio)
             }
         }
-        camControl?.setZoomRatio(zoom)
-        analysis = imageAnalysis
+        camControl?.setZoomRatio(zoom) // Apply initial zoom
     }
 
-    // React to slider changes promptly and thread-safely
     LaunchedEffect(motionWeight) { analyzer?.weight = motionWeight }
     LaunchedEffect(frameGap) { analyzer?.frameGap = frameGap }
     LaunchedEffect(zoom) { camControl?.setZoomRatio(zoom) }
 
     Box(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, _, gestureZoom, _ ->
+                        val minZoom = camInfo?.zoomState?.value?.minZoomRatio ?: 1f
+                        val maxZoom = camInfo?.zoomState?.value?.maxZoomRatio ?: 8f // Default max if not available
+                        val newZoom = (zoom * gestureZoom).coerceIn(minZoom, maxZoom)
+                        onZoomChange(newZoom)
+                    }
+                }
+        ) {
             AndroidBitmapPreview(bitmap = motionBitmap, mirror = useFront)
         }
-        // Overlay controls on top, padded for system bars
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -223,9 +238,7 @@ private fun CameraPreviewWithControls(
                 onMotionWeightChange = onMotionWeightChange,
                 frameGap = frameGap,
                 onFrameGapChange = onFrameGapChange,
-                onToggleCamera = onToggleCamera,
-                zoom = zoom,
-                onZoomChange = { z -> onZoomChange(z) }
+                onToggleCamera = onToggleCamera
             )
         }
     }
@@ -237,9 +250,7 @@ fun MotionControls(
     onMotionWeightChange: (Float) -> Unit,
     frameGap: Int,
     onFrameGapChange: (Int) -> Unit,
-    onToggleCamera: () -> Unit,
-    zoom: Float,
-    onZoomChange: (Float) -> Unit,
+    onToggleCamera: () -> Unit
 ) {
     Column(Modifier.fillMaxWidth()) {
         Text("Motion blend weight: ${"%.2f".format(motionWeight)}")
@@ -247,16 +258,17 @@ fun MotionControls(
         Spacer(Modifier.height(8.dp))
         Text("Frame gap (n): $frameGap")
         Slider(value = frameGap.toFloat(), onValueChange = { onFrameGapChange(it.toInt().coerceIn(1, 30)) }, valueRange = 1f..30f)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Button(onClick = onToggleCamera) { Text("Swap Camera") }
-        }
         Spacer(Modifier.height(8.dp))
-        Text("Zoom: ${"%.2f".format(zoom)}x")
-        Slider(value = zoom, onValueChange = onZoomChange, valueRange = 1f..8f)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            // Placeholder for quality dropdown - to be added later
+            Spacer(Modifier.weight(1f)) // Takes up space so IconButton is on the other side
+            IconButton(onClick = onToggleCamera) {
+                Icon(imageVector = Icons.Filled.Cameraswitch, contentDescription = "Swap Camera")
+            }
+        }
     }
 }
 
-// Simple composable to draw a Bitmap
 @Composable
 fun AndroidBitmapPreview(bitmap: android.graphics.Bitmap?, mirror: Boolean = false) {
     if (bitmap == null) return
@@ -283,7 +295,6 @@ class MotionAnalyzer(
     override fun analyze(image: ImageProxy) {
         try {
             val raw = image.toBitmap() ?: return
-            // Rotate to upright using the image rotation
             val rotated = raw.rotate(image.imageInfo.rotationDegrees)
             if (rotated !== raw) raw.recycle()
             val bmp = if (mirror) rotated.mirrorHorizontally() else rotated
@@ -351,7 +362,6 @@ fun VideoPlayerWithMotion(
     onWeightChange: (Float) -> Unit,
     onFrameGapChange: (Int) -> Unit,
 ) {
-    // For simplicity, decode frames to Bitmaps using MediaMetadataRetriever on a background thread
     val context = LocalContext.current
     var playing by remember { mutableStateOf(true) }
     var positionMs by remember { mutableLongStateOf(0L) }
@@ -378,6 +388,8 @@ fun VideoPlayerWithMotion(
                 }
                 positionMs = (positionMs + 33L).coerceAtMost(durationMs)
                 if (positionMs >= durationMs) playing = false
+                // Small delay to roughly match ~30fps, adjust as needed
+                // kotlinx.coroutines.delay(33) // Consider adding delay if CPU usage is too high
             }
         }
     }
