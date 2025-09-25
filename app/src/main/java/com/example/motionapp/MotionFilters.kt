@@ -4,6 +4,15 @@ import android.graphics.Bitmap
 import android.graphics.Color
 
 object MotionFilters {
+    private class ScratchBuffers(var current: IntArray = IntArray(0), var previous: IntArray = IntArray(0)) {
+        fun ensure(size: Int) {
+            if (current.size != size) current = IntArray(size)
+            if (previous.size != size) previous = IntArray(size)
+        }
+    }
+
+    private val scratch = ThreadLocal.withInitial { ScratchBuffers() }
+
     // Takes current and previous frame, inverts current, then averages with previous.
     // weight is how much to weight the current inverted vs previous (0..1).
     fun invertAndAverage(current: Bitmap, previous: Bitmap, weight: Float): Bitmap {
@@ -11,8 +20,10 @@ object MotionFilters {
         val h = minOf(current.height, previous.height)
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
 
-        val cPixels = IntArray(w * h)
-        val pPixels = IntArray(w * h)
+        val scratchBuffers = scratch.get()
+        scratchBuffers.ensure(w * h)
+        val cPixels = scratchBuffers.current
+        val pPixels = scratchBuffers.previous
         current.getPixels(cPixels, 0, w, 0, 0, w, h)
         previous.getPixels(pPixels, 0, w, 0, 0, w, h)
 

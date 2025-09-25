@@ -186,11 +186,11 @@ private fun CameraPreviewWithControls(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val bitmapConverter = remember { ImageProxyBitmapConverter() }
 
-    var motionBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var motionFrame by remember { mutableStateOf<MotionFrame?>(null) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     var camControl by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
-    var camInfo by remember { mutableStateOf<androidx.camera.core.CameraInfo?>(null) }
     var analyzer by remember { mutableStateOf<MotionAnalyzer?>(null) }
     var minZoom by remember { mutableFloatStateOf(1f) }
     var maxZoom by remember { mutableFloatStateOf(10f) }
@@ -212,11 +212,13 @@ private fun CameraPreviewWithControls(
         val imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setTargetResolution(android.util.Size(quality.width, quality.height))
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
 
         val newAnalyzer = MotionAnalyzer(
             mirror = useFront,
-            onBitmap = { bmp -> motionBitmap = bmp }
+            converter = bitmapConverter,
+            onFrame = { frame -> motionFrame = frame }
         )
         newAnalyzer.frameGap = frameGap
         newAnalyzer.weight = motionWeight
@@ -226,7 +228,6 @@ private fun CameraPreviewWithControls(
         val cameraSelector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
         val camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
         camControl = camera.cameraControl
-        camInfo = camera.cameraInfo
 
         // Capture min/max zoom bounds and apply the current zoom
         camera.cameraInfo.zoomState.value?.let { state ->
@@ -260,7 +261,11 @@ private fun CameraPreviewWithControls(
                     }
                 }
         ) {
-            AndroidBitmapPreview(bitmap = motionBitmap, mirror = useFront)
+            AndroidBitmapPreview(
+                bitmap = motionFrame?.bitmap,
+                mirror = motionFrame?.mirror == true,
+                rotation = (motionFrame?.rotationDegrees ?: 0).toFloat()
+            )
         }
         Box(
             modifier = Modifier
@@ -343,7 +348,7 @@ enum class CameraQuality(val label: String, val width: Int, val height: Int) {
 }
 
 @Composable
-fun AndroidBitmapPreview(bitmap: android.graphics.Bitmap?, mirror: Boolean = false) {
+fun AndroidBitmapPreview(bitmap: android.graphics.Bitmap?, mirror: Boolean = false, rotation: Float = 0f) {
     if (bitmap == null) return
     androidx.compose.ui.viewinterop.AndroidView(
         factory = { ctx -> android.widget.ImageView(ctx).apply {
@@ -351,15 +356,23 @@ fun AndroidBitmapPreview(bitmap: android.graphics.Bitmap?, mirror: Boolean = fal
         } },
         update = {
             it.scaleX = if (mirror) -1f else 1f
+            it.rotation = rotation
             it.setImageBitmap(bitmap)
         },
         modifier = Modifier.fillMaxSize()
     )
 }
 
+data class MotionFrame(
+    val bitmap: android.graphics.Bitmap,
+    val rotationDegrees: Int,
+    val mirror: Boolean
+)
+
 class MotionAnalyzer(
     private val mirror: Boolean,
-    private val onBitmap: (android.graphics.Bitmap) -> Unit,
+    private val converter: ImageProxyBitmapConverter,
+    private val onFrame: (MotionFrame) -> Unit,
 ) : ImageAnalysis.Analyzer {
     private val buffer = ArrayDeque<android.graphics.Bitmap>()
     @Volatile var frameGap: Int = 5
@@ -367,16 +380,13 @@ class MotionAnalyzer(
 
     override fun analyze(image: ImageProxy) {
         try {
-            val raw = image.toBitmap() ?: return
-            val rotated = raw.rotate(image.imageInfo.rotationDegrees)
-            if (rotated !== raw) raw.recycle()
-            val bmp = if (mirror) rotated.mirrorHorizontally() else rotated
+            val bmp = converter.convert(image)
             buffer.addLast(bmp)
             val gap = frameGap.coerceAtLeast(1)
             if (buffer.size > gap) {
                 val prev = buffer.elementAt(buffer.size - 1 - gap)
                 val out = MotionFilters.invertAndAverage(bmp, prev, weight)
-                onBitmap(out)
+                onFrame(MotionFrame(out, image.imageInfo.rotationDegrees, mirror))
             }
             while (buffer.size > 60) buffer.removeFirst().recycle()
         } finally {
