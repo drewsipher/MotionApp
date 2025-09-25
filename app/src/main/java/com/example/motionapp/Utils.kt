@@ -1,16 +1,12 @@
 package com.example.motionapp
 
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import androidx.camera.core.ImageProxy
 
 fun ImageProxy.toBitmap(): Bitmap? {
     return try {
-        val plane = planes[0]
-        val buffer = plane.buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        // This naive conversion works only if format is JPEG. For YUV_420_888, we need conversion.
-        // CameraX ImageAnalysis default is YUV, so use YUV to RGB conversion.
+        // Convert YUV_420_888 to NV21 -> JPEG -> Bitmap
         yuv420ToBitmap(this)
     } catch (e: Exception) {
         null
@@ -51,4 +47,17 @@ private fun yuv420ToBitmap(image: ImageProxy): Bitmap? {
     yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 80, out)
     val imageBytes = out.toByteArray()
     return android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+}
+
+fun Bitmap.rotate(degrees: Int): Bitmap {
+    if (degrees == 0) return this
+    val m = Matrix()
+    m.postRotate(degrees.toFloat())
+    return Bitmap.createBitmap(this, 0, 0, width, height, m, true)
+}
+
+fun Bitmap.mirrorHorizontally(): Bitmap {
+    val m = Matrix()
+    m.preScale(-1f, 1f)
+    return Bitmap.createBitmap(this, 0, 0, width, height, m, true)
 }
