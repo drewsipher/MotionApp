@@ -1,8 +1,16 @@
 package com.example.motionapp
 
 import android.Manifest
+import android.content.ContentUris
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,13 +18,18 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -25,19 +38,26 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -45,7 +65,9 @@ import androidx.navigation.compose.rememberNavController
 import com.example.motionapp.ui.theme.MotionAppTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import java.util.concurrent.ExecutorService
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
@@ -91,7 +113,7 @@ fun StartScreen(onOpenCamera: () -> Unit, onOpenVideo: () -> Unit) {
             Spacer(Modifier.height(24.dp))
             Button(onClick = onOpenCamera, modifier = Modifier.fillMaxWidth()) { Text("Open Camera") }
             Spacer(Modifier.height(12.dp))
-            Button(onClick = onOpenVideo, modifier = Modifier.fillMaxWidth()) { Text("Load Video") }
+            Button(onClick = onOpenVideo, modifier = Modifier.fillMaxWidth()) { Text("Browse Videos") }
         }
     }
 }
@@ -112,10 +134,10 @@ fun CameraScreen(onBack: () -> Unit) {
         permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
     }
 
-    var motionWeight by remember { mutableFloatStateOf(0.5f) } // weight for current inverted vs previous
-    var frameGap by remember { mutableIntStateOf(5) } // n frames apart
-    var useFront by remember { mutableStateOf(false) }
-    var zoom by remember { mutableFloatStateOf(1.0f) }
+    var motionWeight by rememberSaveable { mutableStateOf(0.5f) } // weight for current inverted vs previous
+    var frameGap by rememberSaveable { mutableStateOf(5) } // n frames apart
+    var useFront by rememberSaveable { mutableStateOf(false) }
+    var zoom by remember { mutableStateOf(1.0f) }
     var quality by remember { mutableStateOf(CameraQuality.Medium) }
 
     Column(Modifier.fillMaxSize()) {
@@ -367,14 +389,48 @@ class MotionAnalyzer(
 @Composable
 fun VideoScreen(onBack: () -> Unit) {
     val context = LocalContext.current
-    var videoUri by remember { mutableStateOf<Uri?>(null) }
+    var selectedVideoUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var motionWeight by rememberSaveable { mutableStateOf(0.5f) }
+    var frameGap by rememberSaveable { mutableStateOf(5) }
 
-    val pickVideoLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri -> videoUri = uri }
+    val permission = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_VIDEO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+    }
 
-    var motionWeight by remember { mutableFloatStateOf(0.5f) }
-    var frameGap by remember { mutableIntStateOf(5) }
+    var hasMediaPermission by rememberSaveable {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED)
+    }
+
+    val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> hasMediaPermission = granted }
+
+    LaunchedEffect(permission) {
+        if (!hasMediaPermission) {
+            permissionLauncher.launch(permission)
+        }
+    }
+
+    val videos by produceState<List<DeviceVideo>?>(initialValue = null, hasMediaPermission, context) {
+        value = if (hasMediaPermission) {
+            withContext(Dispatchers.IO) { queryDeviceVideos(context) }
+        } else {
+            emptyList()
+        }
+    }
+
+    val currentVideos = videos
+
+    LaunchedEffect(videos) {
+        val list = videos
+        if (list != null && selectedVideoUri != null && list.none { it.uri == selectedVideoUri }) {
+            selectedVideoUri = null
+        }
+    }
 
     Column(Modifier.fillMaxSize()) {
         androidx.compose.material.TopAppBar(
@@ -382,24 +438,241 @@ fun VideoScreen(onBack: () -> Unit) {
             navigationIcon = {
                 IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
             },
-            actions = {
-                TextButton(onClick = { pickVideoLauncher.launch("video/*") }) { Text("Load") }
+            backgroundColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        )
+
+        when {
+            !hasMediaPermission -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Allow video library access to browse your clips.")
+                }
+            }
+
+            currentVideos == null -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+
+            currentVideos.isEmpty() -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No videos found on this device.")
+                }
+            }
+
+            selectedVideoUri != null -> {
+                VideoPlaybackScreen(
+                    uri = selectedVideoUri!!,
+                    onBack = { selectedVideoUri = null },
+                    motionWeight = motionWeight,
+                    frameGap = frameGap,
+                    onWeightChange = { motionWeight = it },
+                    onFrameGapChange = { frameGap = it }
+                )
+            }
+
+            else -> {
+                Column(Modifier.fillMaxSize()) {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentPadding = PaddingValues(vertical = 8.dp)
+                    ) {
+                        items(currentVideos, key = { it.uri }) { video ->
+                            VideoListItem(
+                                video = video,
+                                selected = selectedVideoUri == video.uri,
+                                onSelect = { selectedVideoUri = video.uri }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private data class DeviceVideo(
+    val uri: Uri,
+    val displayName: String?,
+    val durationMs: Long
+)
+
+private fun queryDeviceVideos(context: Context): List<DeviceVideo> {
+    val resolver = context.contentResolver
+    val projection = arrayOf(
+        MediaStore.Video.Media._ID,
+        MediaStore.Video.Media.DISPLAY_NAME,
+        MediaStore.Video.Media.DURATION
+    )
+    val sortOrder = MediaStore.Video.Media.DATE_ADDED + " DESC"
+
+    val contentUris = buildList {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            addAll(MediaStore.getExternalVolumeNames(context).map { volume ->
+                MediaStore.Video.Media.getContentUri(volume)
+            })
+        }
+        add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+    }.distinct()
+
+    val results = LinkedHashMap<Uri, DeviceVideo>()
+
+    for (contentUri in contentUris) {
+        try {
+            resolver.query(contentUri, projection, null, null, sortOrder)?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val uri = ContentUris.withAppendedId(contentUri, id)
+                    if (results.containsKey(uri)) continue
+
+                    val name = cursor.getString(nameColumn)
+                    val duration = cursor.getLong(durationColumn).coerceAtLeast(0L)
+
+                    results[uri] = DeviceVideo(uri, name, duration)
+                }
+            }
+        } catch (_: SecurityException) {
+            // Permission revoked mid-query or restricted volume; skip.
+        }
+    }
+
+    return results.values.toList()
+}
+
+private fun formatDuration(durationMs: Long): String {
+    val totalSeconds = (durationMs / 1000).coerceAtLeast(0L)
+    val hours = (totalSeconds / 3600).toInt()
+    val minutes = ((totalSeconds % 3600) / 60).toInt()
+    val seconds = (totalSeconds % 60).toInt()
+    return if (hours > 0) {
+        String.format(Locale.getDefault(), "%d:%02d:%02d", hours, minutes, seconds)
+    } else {
+        String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+    }
+}
+
+@Composable
+private fun VideoListItem(
+    video: DeviceVideo,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    val highlight = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(highlight)
+            .clickable(onClick = onSelect)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        VideoThumbnail(uri = video.uri)
+
+        Spacer(Modifier.width(16.dp))
+
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = video.displayName ?: "Untitled video",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = formatDuration(video.durationMs),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun VideoThumbnail(uri: Uri, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val thumbnail by produceState<Bitmap?>(initialValue = null, uri, context) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    context.contentResolver.loadThumbnail(uri, Size(320, 320), null)
+                } else {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(context, uri)
+                        retriever.getFrameAtTime(0)
+                    } finally {
+                        retriever.release()
+                    }
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    val currentThumbnail = thumbnail
+
+    if (currentThumbnail != null) {
+        Image(
+            bitmap = currentThumbnail.asImageBitmap(),
+            contentDescription = null,
+            modifier = modifier
+                .size(72.dp)
+                .clip(MaterialTheme.shapes.small),
+            contentScale = ContentScale.Crop
+        )
+    } else {
+        Box(
+            modifier = modifier
+                .size(72.dp)
+                .clip(MaterialTheme.shapes.small)
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = "Loading…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun VideoPlaybackScreen(
+    uri: Uri,
+    onBack: () -> Unit,
+    motionWeight: Float,
+    frameGap: Int,
+    onWeightChange: (Float) -> Unit,
+    onFrameGapChange: (Int) -> Unit,
+) {
+    Column(Modifier.fillMaxSize()) {
+        androidx.compose.material.TopAppBar(
+            title = { Text("Motion Preview") },
+            navigationIcon = {
+                IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
             },
             backgroundColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface
         )
 
-        if (videoUri == null) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Pick a video to begin")
-            }
-        } else {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
             VideoPlayerWithMotion(
-                uri = videoUri!!,
+                uri = uri,
                 weight = motionWeight,
                 frameGap = frameGap,
-                onWeightChange = { motionWeight = it },
-                onFrameGapChange = { frameGap = it }
+                onWeightChange = onWeightChange,
+                onFrameGapChange = onFrameGapChange
             )
         }
     }
